@@ -155,21 +155,31 @@ def _safe_provider_status(error: Exception) -> str:
     implementation-specific information.  The public health result intentionally
     exposes only one of these short categories.
     """
-    status_code = getattr(error, "code", None) or getattr(error, "status_code", None)
-    try:
-        status_code = int(status_code)
-    except (TypeError, ValueError):
-        status_code = None
-    if status_code in {401, 403}:
-        return "credentials_rejected"
-    if status_code == 404:
-        return "model_unavailable"
-    if status_code == 429:
-        return "rate_limited"
-    if status_code is not None and status_code >= 500:
-        return "provider_unreachable"
-    if isinstance(error, (requests.ConnectionError, requests.Timeout)):
-        return "endpoint_unreachable"
+    seen: set[int] = set()
+    current: Exception | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = (
+            getattr(current, "code", None)
+            or getattr(current, "status_code", None)
+            or getattr(getattr(current, "response", None), "status_code", None)
+        )
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code in {401, 403}:
+            return "credentials_rejected"
+        if status_code == 404:
+            return "model_unavailable"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code is not None and status_code >= 500:
+            return "provider_unreachable"
+        if isinstance(current, (requests.ConnectionError, requests.Timeout)):
+            return "endpoint_unreachable"
+        cause = getattr(current, "__cause__", None)
+        current = cause if isinstance(cause, Exception) else None
     if isinstance(error, ValueError):
         return "invalid_provider_response"
     return "provider_check_failed"
@@ -306,45 +316,80 @@ class LightProvider:
         raise RuntimeError("No general text model is available for the lightweight tasks.")
 
     @staticmethod
-    def _extract_json(text: str) -> dict[str, Any]:
-        content = text.strip()
-        if content.startswith("```"):
-            content = content.split("```", 2)[1] if content.count("```") >= 2 else content
-            content = re.sub(r"^json", "", content, flags=re.I).strip()
-        start, end = content.find("{"), content.rfind("}")
-        if start >= 0 and end > start:
-            content = content[start : end + 1]
-        payload = json.loads(content)
-        if not isinstance(payload, dict):
-            raise ValueError("Expected a JSON object")
-        return payload
+    def _extract_json(content: Any) -> dict[str, Any]:
+        """Parse a JSON object from standard or markdown-fenced chat output.
+
+        Some OpenAI-compatible models obey the instruction but wrap their JSON
+        in a code fence, prepend a short sentence, or return an already decoded
+        object. Accept those harmless transport variations, but never guess or
+        coerce an invalid clinical decision payload.
+        """
+        if isinstance(content, dict):
+            return content
+        if not isinstance(content, str):
+            raise ValueError("Expected JSON text or object")
+
+        text = content.strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+        candidates = [fenced.group(1)] if fenced else []
+        candidates.append(text)
+
+        decoder = json.JSONDecoder()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                # Decode the first complete JSON object rather than slicing from
+                # the first to the last brace, which breaks when prose contains
+                # an additional brace after a valid response.
+                for match in re.finditer(r"\{", candidate):
+                    try:
+                        payload, _ = decoder.raw_decode(candidate[match.start() :])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        return payload
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise ValueError("Expected one valid JSON object")
 
     def json(self, prompt: str, max_retries: int = 3) -> dict[str, Any]:
         last_error: Exception | None = None
+        require_json_mode = True
         for attempt in range(max_retries):
             try:
+                request_payload: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return exactly one valid JSON object. Do not include markdown, explanations, or text outside JSON.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.01,
+                }
+                if require_json_mode:
+                    request_payload["response_format"] = {"type": "json_object"}
                 response = requests.post(
                     f"{LIGHT_LLM_BASE_URL}/chat/completions",
                     headers=self.headers,
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "Return exactly one valid JSON object. Do not include markdown, explanations, or text outside JSON.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.01,
-                        "response_format": {"type": "json_object"},
-                    },
+                    json=request_payload,
                     timeout=45,
                 )
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]
-                return self._extract_json(str(content))
+                return self._extract_json(content)
             except Exception as exc:
                 last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if require_json_mode and status_code in {400, 404, 422}:
+                    # Keep the JSON-only prompt, but use the compatible plain
+                    # chat-completion form for models that reject this optional
+                    # OpenAI response-format extension.
+                    require_json_mode = False
                 if attempt < max_retries - 1:
                     time.sleep(1 + attempt)
         if isinstance(last_error, ValueError):
@@ -543,14 +588,55 @@ class RagEngine:
         index = getattr(self, "recommendation_index", self._build_recommendation_index())
         scored: list[tuple[dict[str, Any], float]] = []
         minimum_overlap = 1 if len(question_terms) == 1 else 2
+        is_broad_topic_request = len(question_terms) == 1
         for chunk in index:
             source = normalize_for_retrieval(chunk["original_text"])
             overlap = sum(self._guideline_term_matches_source(term, source) for term in question_terms)
             if overlap < minimum_overlap:
                 continue
+            # A question carrying only one topic term (for example, "exercise")
+            # asks for the guideline's main recommendation, not a restricted
+            # implementation option. In that narrow situation, prefer a strong,
+            # broadly applicable "should" recommendation over a conditional
+            # "may use" recommendation. Explicit modifiers in a question (such
+            # as blood-flow restriction, foot orthoses, or taping) still make
+            # term overlap dominant and preserve the specialised evidence route.
+            strength = self._recommendation_strength(chunk["original_text"])
+            conditionality = self._recommendation_conditionality(chunk["original_text"])
             score = 1.0 + (overlap / len(question_terms))
+            if is_broad_topic_request:
+                score += 0.20 * strength - 0.12 * conditionality
             scored.append((chunk, score))
         return sorted(scored, key=lambda item: item[1], reverse=True)[:TOP_K]
+
+    @staticmethod
+    def _recommendation_strength(text: str) -> float:
+        """Score only the normative force already present in the active PDF."""
+        normalized = normalize_for_retrieval(text)
+        if re.search(r"\bclinicians?\s+should\b|\bis recommended\b", normalized):
+            return 1.0
+        if re.search(r"\bclinicians?\s+may\b|\bmay use\b", normalized):
+            return 0.35
+        return 0.60
+
+    @staticmethod
+    def _recommendation_conditionality(text: str) -> float:
+        """Identify PDF-native qualifiers without making a medical inference.
+
+        This does not reject a recommendation. It only helps a broad question
+        avoid ranking a recommendation limited to a specific clinical condition
+        above the chapter's primary recommendation.
+        """
+        normalized = normalize_for_retrieval(text)
+        return float(
+            len(
+                re.findall(
+                    r"\b(?:for|in|when)\s+(?:patients?|people|those)\s+(?:with|who)\b"
+                    r"|\b(?:in the short term|when pain|limiting|resisted)\b",
+                    normalized,
+                )
+            )
+        )
 
     def _build_recommendation_index(self) -> list[dict[str, Any]]:
         """Index recommendation passages from the active PFP document only."""
@@ -618,6 +704,39 @@ QUESTION: {question}"""
     def _extract_json(text: str) -> dict[str, Any]:
         return LightProvider._extract_json(text)
 
+    @classmethod
+    def _extract_gemini_json(cls, response: Any) -> dict[str, Any]:
+        """Read a structured Gemini response across supported SDK response shapes.
+
+        The SDK normally exposes ``response.text``. Some provider/model variants
+        instead expose parsed content or candidate parts, especially when native
+        JSON mode is requested. The client accepts only a real JSON object from
+        one of those documented shapes; it never derives clinical content from a
+        missing response.
+        """
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, dict):
+            return parsed
+
+        text_candidates: list[str] = []
+        direct_text = getattr(response, "text", None)
+        if isinstance(direct_text, str) and direct_text.strip():
+            text_candidates.append(direct_text)
+
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    text_candidates.append(part_text)
+
+        for text in text_candidates:
+            try:
+                return cls._extract_json(text)
+            except ValueError:
+                continue
+        raise ValueError("Gemini did not return a valid final-answer JSON object.")
+
     def _final_gemini_json(self, prompt: str, max_retries: int = 4) -> dict[str, Any]:
         """Generate the final answer with bounded retries for transient provider failures.
 
@@ -628,26 +747,28 @@ QUESTION: {question}"""
         if self.gemini is None:
             raise LayerFailure("generation", "final_generation_unavailable", "generation", True)
         last_error: Exception | None = None
+        use_native_json_mode = True
         for attempt in range(max_retries):
             try:
+                config_kwargs: dict[str, Any] = {
+                    "temperature": 0.1,
+                    "max_output_tokens": 2048,
+                }
+                if use_native_json_mode:
+                    config_kwargs["response_mime_type"] = "application/json"
                 response = self.gemini.models.generate_content(
                     model=FINAL_GEMINI_MODEL,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=2048,
-                        response_mime_type="application/json",
-                    ),
+                    config=types.GenerateContentConfig(**config_kwargs),
                 )
-                response_text = str(getattr(response, "text", "") or "").strip()
-                if not response_text:
-                    raise ValueError("Gemini returned an empty final-answer response.")
-                parsed = self._extract_json(response_text)
-                if not isinstance(parsed, dict):
-                    raise ValueError("Gemini final-answer output was not a JSON object.")
-                return parsed
+                return self._extract_gemini_json(response)
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, ValueError):
+                    # The prompt still requires JSON, but retry without the native
+                    # response-mime extension for model/provider combinations that
+                    # return incomplete structured output in that mode.
+                    use_native_json_mode = False
                 LOGGER.warning(
                     "Final Gemini generation attempt %d/%d failed: %s",
                     attempt + 1,
