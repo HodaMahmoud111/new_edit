@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PATELLIA - Evidence Conversation Workspace</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="ambient-glow"></div>
+
+    <div class="workspace-layout">
+        <!-- Source Sidebar -->
+        <aside class="source-sidebar">
+            <div class="logo-title">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                PATELLIA
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                <a href="/" class="side-nav-link">← Return to Overview</a>
+                <a href="/technical" class="side-nav-link">📊 View System Metrics</a>
+            </div>
+
+            <div class="ref-card">
+                <span class="ref-label">Active Clinical Reference</span>
+                <div class="ref-name" id="activeDocName">Patellofemoral Pain CPG (APTA/JOSPT 2019)</div>
+                <div style="font-size:11px; color:#34d399;">● Source Verified & Ready</div>
+                <button class="change-ref-btn" onclick="openUploadModal()">Change Reference (PDF)</button>
+            </div>
+        </aside>
+
+        <!-- Main Conversation Area -->
+        <main class="chat-workspace">
+            <header class="workspace-header">
+                <div style="font-size:14px; font-weight:600;" id="headerTitle">Evidence Conversation Workspace</div>
+                <button onclick="toggleLang()" id="langBtn" class="lang-toggle-btn" aria-label="Toggle language">العربية</button>
+            </header>
+
+            <div class="workspace-messages" id="messagesList" aria-live="polite">
+                <div class="msg-bubble msg-ai">
+                    <p id="welcomeText">Welcome to the Patellofemoral Pain Evidence Workspace. I provide guideline-grounded recommendations based on CPG standards, not personal medical diagnoses.</p>
+                    <div class="suggestions-wrap">
+                        <div class="suggest-chip" onclick="applySuggestion('What are the recommended exercise therapies for Patellofemoral Pain?')">Recommended exercise therapies</div>
+                        <div class="suggest-chip" onclick="applySuggestion('What are the primary diagnostic criteria for PFP?')">Diagnostic criteria</div>
+                        <div class="suggest-chip" onclick="applySuggestion('ما هي أفضل التمارين العلاجية الموصى بها لألم الرضفة الفخذي؟')">تمارين علاجية (عربي)</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-bar">
+                <div class="input-container">
+                    <textarea id="questionInput" placeholder="Ask a clinical question based on the reference..." rows="1"></textarea>
+                    <button class="send-btn" id="sendBtn" onclick="handleSendAction()" aria-label="Send query">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                    </button>
+                </div>
+            </div>
+        </main>
+
+        <!-- Right Evidence & Inspector Column -->
+        <aside class="evidence-column">
+            <div class="evidence-title" id="evidenceTitle">Supporting Reference Passages</div>
+            <div id="evidenceListContainer" style="display:flex; flex-direction:column; gap:12px;">
+                <div style="font-size:12px; color:var(--text-muted); text-align:center; margin-top:30px;" id="noEvidenceText">
+                    No passages retrieved yet. Ask a question to inspect direct clinical quotes.
+                </div>
+            </div>
+
+            <!-- Answer Inspector (Closed by default) -->
+            <details class="answer-inspector" id="answerInspectorDetails">
+                <summary class="inspector-summary" tabindex="0" role="button" aria-expanded="false">
+                    <span>⚙️ Answer Inspector</span>
+                    <svg class="summary-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                </summary>
+                <div class="inspector-content" id="inspectorBody">
+                    <div class="inspector-empty">Submit a query to inspect live pipeline metadata.</div>
+                </div>
+            </details>
+        </aside>
+    </div>
+
+    <!-- Upload Modal -->
+    <div class="modal-overlay" id="uploadModal">
+        <div class="modal-content">
+            <h3 style="font-size:16px; margin-bottom:12px;">Upload Clinical Reference (PDF)</h3>
+            <p style="font-size:12px; color:var(--text-muted); margin-bottom:16px;">Upload a verified clinical practice guideline regarding Patellofemoral Pain.</p>
+            <input type="file" id="pdfFileInput" accept="application/pdf" style="margin-bottom:16px; font-size:12px; color:#fff;">
+            <div id="uploadStatus" style="font-size:12px; margin-bottom:12px;"></div>
+            <div style="display:flex; justify-content:flex-end; gap:8px;">
+                <button class="change-ref-btn" onclick="closeUploadModal()">Cancel</button>
+                <button class="change-ref-btn" style="background:var(--text-accent); color:#050d1a; font-weight:600;" onclick="submitPdf()">Process Reference</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
